@@ -3,11 +3,11 @@
 # This script installs the Sandstorm Personal Cloud Server on your Linux
 # machine. You can run the latest installer directly from the web by doing:
 #
-#     curl https://install.sandstorm.io | bash
+#     curl https://install.sandstorm.org | bash
 #
 # If `curl|bash` makes you uncomfortable, see other options here:
 #
-#     https://docs.sandstorm.io/en/latest/install/
+#     https://docs.sandstorm.org/en/latest/install/
 #
 # This script only modifies your system in the following ways:
 # - Install Sandstorm into the directory you choose, typically /opt/sandstorm.
@@ -85,7 +85,7 @@ fail() {
 
   # Users can export REPORT=no to avoid the error-reporting behavior, if they need to.
   if [ "${REPORT:-yes}" = "yes" ] ; then
-    if USE_DEFAULTS=no prompt-yesno "Hmm, installation failed. Would it be OK to send an anonymous error report to the sandstorm.io team so we know something is wrong?
+    if USE_DEFAULTS=no prompt-yesno "Hmm, installation failed. Would it be OK to send an anonymous error report to the Sandstorm team so we know something is wrong?
 It would only contain this error code: $error_code" "yes" ; then
       echo "Sending problem report..." >&2
       local BEARER_TOKEN="4-Og3Ty2SPmpkZGnVc_8hnBGXK0JBBXDeBn_55FWixJ"
@@ -236,7 +236,11 @@ prompt() {
   echo -en '\e[1m' >&3
   echo -n "$1 [$2]" >&3
   echo -en '\e[0m ' >&3
-  read -u 3 VALUE
+  # FD 3 may be at EOF or write-only in a headless invocation. Treat that as "no input"
+  if ! IFS= read -r -u 3 VALUE 2>/dev/null; then
+    echo >&3
+    return 1
+  fi
   if [ -z "$VALUE" ]; then
     VALUE=$2
   fi
@@ -246,7 +250,10 @@ prompt() {
 prompt-numeric() {
   local NUMERIC_REGEX="^[0-9]+$"
   while true; do
-    local VALUE=$(prompt "$@")
+    local VALUE
+    if ! VALUE=$(prompt "$@"); then
+      return 1
+    fi
 
     if ! [[ "$VALUE" =~ $NUMERIC_REGEX ]] ; then
       echo "You entered '$VALUE'. Please enter a number." >&3
@@ -259,7 +266,10 @@ prompt-numeric() {
 
 prompt-yesno() {
   while true; do
-    local VALUE=$(prompt "$@")
+    local VALUE
+    if ! VALUE=$(prompt "$@"); then
+      return 1
+    fi
 
     case $VALUE in
       y | Y | yes | YES | Yes )
@@ -314,7 +324,6 @@ usage() {
   echo '' >&2
   echo 'If -d is specified, the auto-installs with defaults suitable for app development.' >&2
   echo 'If -e is specified, default to listening on an external interface, not merely loopback.' >&2
-  echo 'If -i is specified, default to (i)nsecure mode where we do not request a HTTPS certificate.' >&2
   echo 'If -p is specified, use its argument (PORT_NUMBER) as the default port for HTTP. Otherwise, use 6080. Note that if the install script enables HTTPS, it will use 443 instead!'
   echo 'If -u is specified, default to avoiding root priviliges. Note that the dev tools only work if the server has root privileges.' >&2
   exit 1
@@ -363,7 +372,9 @@ handle_args() {
         USE_EXTERNAL_INTERFACE="yes"
         ;;
       i)
-        # TODO(soon): Fix or remove this option, which currently does nothing
+        # The -i ("insecure mode") option was never implemented. Keep accepting it
+        # so existing scripts that pass it don't break, but tell the user it is ignored.
+        echo "WARNING: The -i option is deprecated and has no effect. Ignoring it." >&2
         ;;
       u)
         PREFER_ROOT=no
@@ -412,10 +423,10 @@ rerun_script_as_root() {
   ENVVARS="$ENVVARS CURL_USER_AGENT=$CURL_USER_AGENT"
 
   if [ "$(basename $SCRIPT_NAME)" == bash ]; then
-    # Probably ran like "curl https://sandstorm.io/install.sh | bash"
+    # Probably ran like "curl https://sandstorm.org/install.sh | bash"
     echo "Re-running script as root..."
 
-    exec sudo bash -euo pipefail -c "curl -fs -A $CURL_USER_AGENT https://install.sandstorm.io | $ENVVARS bash"
+    exec sudo bash -euo pipefail -c "curl -fs -A $CURL_USER_AGENT https://install.sandstorm.org | $ENVVARS bash"
   elif [ "$(basename $SCRIPT_NAME)" == install.sh ] && [ -e "$0" ]; then
     # Probably ran like "bash install.sh" or "./install.sh".
     echo "Re-running script as root..."
@@ -431,7 +442,7 @@ rerun_script_as_root() {
 Please download a copy and name it 'install.sh' and run that as root, perhaps using sudo. \
 Try this command:
 
-curl https://install.sandstorm.io/ > install.sh && sudo bash install.sh"
+curl https://install.sandstorm.org/ > install.sh && sudo bash install.sh"
 }
 
 set_umask() {
@@ -458,7 +469,7 @@ assert_linux_x86_64() {
     fail "E_NON_LINUX" "Sandstorm requires Linux. If you want to run Sandstorm on a Windows or
 Mac system, you can use Vagrant or another virtualization tool. See our install documentation:
 
-- https://docs.sandstorm.io/en/latest/install/"
+- https://docs.sandstorm.org/en/latest/install/"
   fi
 
   if [ "$(uname -m)" != x86_64 ]; then
@@ -533,6 +544,64 @@ __EOF__
     sysctl -wq "kernel.unprivileged_userns_clone=$OLD_VALUE" || true
     return
   fi
+}
+
+maybe_install_apparmor_userns_profile() {
+  # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor by
+  # default. Give Sandstorm the userns permission.
+
+  if [ "yes" != "$CURRENTLY_UID_ZERO" ]; then
+    return
+  fi
+
+  if [ ! -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+    return
+  fi
+
+  if [ ! -d /etc/apparmor.d ]; then
+    return
+  fi
+
+  if ! which apparmor_parser > /dev/null; then
+    echo "NOTE: AppArmor restricts unprivileged user namespaces, but apparmor_parser was not found."
+    return
+  fi
+
+  local PROFILE_PATH="/etc/apparmor.d/sandstorm"
+  if ! cat > "$PROFILE_PATH" << __EOF__
+# Allow Sandstorm to create user namespaces on systems that restrict
+# unprivileged user namespaces through AppArmor.
+profile sandstorm ${DIR}/sandstorm flags=(unconfined) {
+  userns,
+}
+
+profile sandstorm-latest ${DIR}/latest/sandstorm flags=(unconfined) {
+  userns,
+}
+
+profile sandstorm-build ${DIR}/sandstorm-*/sandstorm flags=(unconfined) {
+  userns,
+}
+
+profile sandstorm-custom-build ${DIR}/sandstorm-custom.*/sandstorm flags=(unconfined) {
+  userns,
+}
+
+profile sandstorm-usr-local-bin /usr/local/bin/sandstorm flags=(unconfined) {
+  userns,
+}
+
+profile spk-usr-local-bin /usr/local/bin/spk flags=(unconfined) {
+  userns,
+}
+__EOF__
+  then
+    echo "NOTE: Could not install AppArmor profile for Sandstorm."
+    return
+  fi
+
+  apparmor_parser -r "$PROFILE_PATH" 2>/dev/null ||
+    echo "NOTE: Installed AppArmor profile for Sandstorm, but could not load it."
 }
 
 test_if_dev_tcp_works() {
@@ -709,7 +778,7 @@ to install without using root access. In that case, Sandstorm will operate OK bu
     if [ -n "${SUDO_USER:-}" ]; then
       echo "* Add you ($SUDO_USER) to the $DEFAULT_SERVER_USER group so you can read/write app data."
     fi
-    echo "* Expose the service only on localhost aka local.sandstorm.io, not the public Internet."
+    echo "* Expose the service only on localhost aka local.sandstorm.org, not the public Internet."
     echo "* Enable 'dev accounts', for easy developer login."
     if [ "unknown" == "$INIT_SYSTEM" ]; then
       echo "*** WARNING: Could not detect how to run Sandstorm at startup on your system. ***"
@@ -736,10 +805,10 @@ to install without using root access. In that case, Sandstorm will operate OK bu
     # Bind to localhost, unless -e specified in argv.
     USE_EXTERNAL_INTERFACE="${USE_EXTERNAL_INTERFACE:-no}"
 
-    # Use local.sandstorm.io as hostname unless environment variable declared otherwise. This
+    # Use local.sandstorm.org as hostname unless environment variable declared otherwise. This
     # short-circuits the code elsewhere that uses the system hostname if USE_EXTERNAL_INTERFACE is
     # "yes".
-    SS_HOSTNAME="${SS_HOSTNAME:-local.sandstorm.io}"
+    SS_HOSTNAME="${SS_HOSTNAME:-local.sandstorm.org}"
 
     # Use 30025 as the default SMTP_LISTEN_PORT.
     SMTP_LISTEN_PORT="${DEFAULT_SMTP_PORT}"
@@ -819,6 +888,9 @@ full_server_install() {
     else
       echo "* Configure Sandstorm to start on system boot (with $INIT_SYSTEM)"
     fi
+    if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+      echo "* Configure AppArmor to allow Sandstorm to create unprivileged user namespaces."
+    fi
     echo "* Listen for inbound email on port ${PLANNED_SMTP_PORT}."
     echo ""
 
@@ -848,7 +920,7 @@ full_server_install() {
       echo "      without HTTPS. This makes sense if you're OK with typing the port number"
       echo "      into your browser whenever you access Sandstorm and you don't need"
       echo "      security. This also makes sense if you are going to set up a reverse proxy;"
-      echo "      if so, see https://docs.sandstorm.io/en/latest/administering/reverse-proxy/"
+      echo "      if so, see https://docs.sandstorm.org/en/latest/administering/reverse-proxy/"
       echo ""
       echo "      If you want, you can quit this script with Ctrl-C now, and go uninstall"
       echo "      your other web server, and then run this script again. It is also OK to"
@@ -951,9 +1023,9 @@ configure_hostnames() {
     SS_HOSTNAME="${SS_HOSTNAME:-$(hostname -f 2>/dev/null || hostname)}"
   else
     BIND_IP=127.0.0.1
-    SS_HOSTNAME=local.sandstorm.io
+    SS_HOSTNAME=local.sandstorm.org
     if [ "yes" != "$USE_DEFAULTS" ] ; then
-      echo "Note: local.sandstorm.io maps to 127.0.0.1, i.e. your local machine."
+      echo "Note: local.sandstorm.org maps to 127.0.0.1, i.e. your local machine."
       echo "For reasons that will become clear in the next step, you should use this"
       echo "instead of 'localhost'."
     fi
@@ -996,9 +1068,9 @@ configure_hostnames() {
   fi
 
   # If the BASE_URL looks like localhost, then we had better use a
-  # DEFAULT_WILDCARD of local.sandstorm.io so that wildcard DNS works.
+  # DEFAULT_WILDCARD of local.sandstorm.org so that wildcard DNS works.
   if [[ "$BASE_URL" =~ ^http://localhost(|:[0-9]*)(/.*)?$ ]]; then
-    DEFAULT_WILDCARD=*.local.sandstorm.io${BASH_REMATCH[1]}
+    DEFAULT_WILDCARD=*.local.sandstorm.org${BASH_REMATCH[1]}
   elif [[ "$BASE_URL" =~ ^[^:/]*://([^/]*)/?$ ]]; then
     DEFAULT_WILDCARD="${DEFAULT_WILDCARD:-*.${BASH_REMATCH[1]}}"
   else
@@ -1019,8 +1091,8 @@ configure_hostnames() {
       echo "prefix, like \"ss-*.foo.example.com\". Note that if your server's main page"
       echo "is served over SSL, the wildcard address must support SSL as well, which"
       echo "implies that you must have a wildcard certificate. For local-machine servers,"
-      echo "we have mapped *.local.sandstorm.io to 127.0.0.1 for your convenience, so you"
-      echo "can use \"*.local.sandstorm.io\" here. If you are serving off a non-standard"
+      echo "we have mapped *.local.sandstorm.org to 127.0.0.1 for your convenience, so you"
+      echo "can use \"*.local.sandstorm.org\" here. If you are serving off a non-standard"
       echo "port, you must include it here as well."
     fi
     WILDCARD_HOST=$(prompt "Wildcard host:" "$DEFAULT_WILDCARD")
@@ -1054,10 +1126,10 @@ choose_install_dir() {
     error "You seem to already have a ${DIR} directory with a Sandstorm installation inside. You should either:"
     error ""
     error "1. Reconfigure that Sandstorm install using its configuration file -- ${DIR}/sandstorm.conf -- or the admin interface. See docs at:"
-    error "https://docs.sandstorm.io/en/latest/administering/"
+    error "https://docs.sandstorm.org/en/latest/administering/"
     error ""
     error "2. Uninstall Sandstorm before attempting to perform a new install. Even if you created a sandcats.io hostname, it is safe to uninstall so long as you do not need the data in your Sandstorm install. When you re-install Sandstorm, you can follow a process to use the old hostname with the new install. See uninstall docs at:"
-    error "https://docs.sandstorm.io/en/latest/install/#uninstall"
+    error "https://docs.sandstorm.org/en/latest/install/#uninstall"
     error ""
     error "3. Use a different target directory for the new Sandstorm install. Try running install.sh with the -d option."
     error ""
@@ -1307,7 +1379,7 @@ download_latest_bundle_and_extract_if_needed() {
   # to do a Sandstorm install. We had to stop using "install" because vagrant-spk happens to use
   # &type=install during situations that we do not want to categorize as an attempt by a human to
   # install Sandstorm.
-  BUILD="$(curl -A "$CURL_USER_AGENT" -fs "https://install.sandstorm.io/$DEFAULT_UPDATE_CHANNEL?from=0&type=install_v2")"
+  BUILD="$(curl -A "$CURL_USER_AGENT" -fs "https://install.sandstorm.org/$DEFAULT_UPDATE_CHANNEL?from=0&type=install_v2")"
   BUILD_DIR="sandstorm-${BUILD}"
 
   if [[ ! "$BUILD" =~ ^[0-9]+$ ]]; then
@@ -1317,7 +1389,7 @@ download_latest_bundle_and_extract_if_needed() {
   do-download() {
     rm -rf "${BUILD_DIR}"
     WORK_DIR="$(mktemp -d ./sandstorm-installer.XXXXXXXXXX)"
-    local URL="https://dl.sandstorm.io/sandstorm-$BUILD.tar.xz"
+    local URL="https://dl.sandstorm.org/sandstorm-$BUILD.tar.xz"
     echo "Downloading: $URL"
     retryable_curl "$URL" "$WORK_DIR/sandstorm-$BUILD.tar.xz"
     retryable_curl "$URL.sig" "$WORK_DIR/sandstorm-$BUILD.tar.xz.sig"
@@ -1326,47 +1398,69 @@ download_latest_bundle_and_extract_if_needed() {
       export GNUPGHOME="$WORK_DIR/.gnupg"
       mkdir -m 0700 -p "$GNUPGHOME"
 
-      # Regenerate with: gpg --armor --export 160D2D577518B58D94C9800B63F227499DA8CCBD
+      # Regenerate with: gpg --armor --export 7F7819F90B7E810F26CF8B9FA733226C7091EDA2
       gpg --dearmor > "$WORK_DIR/sandstorm-keyring.gpg" << __EOF__
 -----BEGIN PGP PUBLIC KEY BLOCK-----
-Version: GnuPG v1
 
-mQENBFX8ypkBCAC8sjX5yZqKdW8nY7aE/GpVeS+qSCbpYSJwixYNFXbz3MQihR3S
-suvg5uw1KyuQb23c0LwirfxazVf7txKhQNaNU3ek62LG3wcGeBrvQGsIUMbkatay
-/163CLeVWfSK1Z4pFc4dhdjXYSOz0oZxd7Mp78crBbGKmyn7PtzdAqt+XfEXNuee
-cDbx++P57n5s5xc5fQWznt333IMgmgTREGUROfh4kL376rFAS208XIywJlUVkoKM
-kIzgcjevFGwYKdsLigHXCDp9toQHl8oPjFV+RE8Br8ciJlMp9CqCfHGwj0Orxasc
-e9moLqqUc+iKdg9bQfuAbJ/jFNhGmV/CVv9tABEBAAG0LlNhbmRzdG9ybS5pbyAo
-cmVsZWFzZXMpIDxzdXBwb3J0QHNhbmRzdG9ybS5pbz6JATgEEwECACIFAlX8ypkC
-GwMGCwkIBwMCBhUIAgkKCwQWAgMBAh4BAheAAAoJEGPyJ0mdqMy91bYH/iTg9qbw
-G3th57Yf70NtyMJE3UBFDYDNAgT45UBEHoHhQM5cdFu/EIHggOKl/A2zL19Nh555
-5F5o3jiJChQ0cvpoVnDdA5lRKD9iK6hzAba9fCVAx/od1PULQP7KV+uHTQuclSFO
-DBvpgT8bMY9LmlpTl+l2lvYd+c50w3jZMFwh8JrJYAc3X0kBfVEywVZkjH8Nw5nD
-v/j5Of3XXfEg84tNyWSYUMrYVORJyfHtA9e3JXNv5BMxH73AVLnyCJhCaodQsC6Z
-hFkHUvvRb58ZqKXMtLYTd/8XLIvpkgRNX6EHWDslJh3BaBwHSuqDNssh1TW5xPjA
-9vkPDzeZfLkuxpy5AQ0EVfzKmQEIANyi22M/3KhkghsPA6Rpha1lx6JJCb4p7E21
-y82OGFUwcMpZkSgh1lARgp/Mvc2CHhAXi6NkGbgYc1q5rgARSvim2EMZNQOEqRb9
-teEeI3w7Nz8Q/WoWck9WaXg8EdELtBOXYgVEirVddUl6ftUvCeBh3hE2Y/CLQSXL
-CYXdQ2/MN6xV8tepuWOu0aPxxPUNea9ceDNZ8/CXEL32pzv9SUX/3KgSnFTzmxNP
-thzXGuaAQGMZRu3cdTSeK9UUX4L3lxv7p0nE/2K18MU3FayTJqspfUCc4BgHZRMN
-sh+2/YNfJgi0uWex1WnU94ZIp4A0uic54bU1ZECSwxg81KHaEEkAEQEAAYkBHwQY
-AQIACQUCVfzKmQIbDAAKCRBj8idJnajMvZgPB/0THpTPnfsYNkwQrBsrTq413ZTF
-JmVyeZ9xnGDImOdyHhGLlnLC1YEnaNUVEyMKifya4TF2utrLrsMT9TC/dWvFsYlJ
-oMcUpaSlrFoAoPp3pdOGCIRYNhWGHoxy0Ti1WAa/6A+GoHJpUEz85/jD4vjgYlCX
-ZFW1Pji9PbdIZFZQR4FyYBkkZOUq6yyTNR0syQPVy3EsPVvXzszm2zV/1YjGymgj
-MKeYR9+VU+PlFAY9wwLWLTFeSzxTyVjbPwF5bWHV32GM8g0/NgA6a1JLL40v7pqf
-uYvFk2KJpo3gZNGJ72gLkSzie7Eu1/V67JIG9TwfrJUEj8Uwd5zPv1MOqfWl
-=OiS5
+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
+HnMvCadPOefOlCvG/TI2AnfmkxuwWUcDt3AR7g==
+=K6RJ
 -----END PGP PUBLIC KEY BLOCK-----
 __EOF__
 
       if gpg --no-default-keyring --keyring $WORK_DIR/sandstorm-keyring.gpg --status-fd 1 \
              --verify $WORK_DIR/sandstorm-$BUILD.tar.xz{.sig,} 2>/dev/null | \
-          grep -q '^\[GNUPG:\] VALIDSIG 160D2D577518B58D94C9800B63F227499DA8CCBD '; then
+          grep -q '^\[GNUPG:\] VALIDSIG 7F7819F90B7E810F26CF8B9FA733226C7091EDA2 '; then
         echo "GPG signature is valid."
       else
         rm -rf sandstorm-$BUILD
-        fail "E_INVALID_GPG_SIG" "GPG signature is NOT valid! Please report to security@sandstorm.io immediately!"
+        fail "E_INVALID_GPG_SIG" "GPG signature is NOT valid! Please report to security@sandstorm.org immediately!"
       fi
 
       unset GNUPGHOME
@@ -1383,33 +1477,15 @@ __EOF__
 
     # We used to reject packages older than 30 days on the assumption the package would definitely
     # be updated more often than that. For about six years the existence of this check was the main
-    # thing that drove me (Kenton) to do a release every month, although I occasionally forgot which
-    # would temporarily block new installs. Surprisingly (to me, at least), whenever this happend,
-    # people would actually notice and complain within a day or two -- people were apparently
-    # still installing Sandstorm regularly.
-    #
-    # As of Feb 2023, though, I think it's time to retire this check and end the monthly update
-    # schedule, for several reasons:
-    # - In 2022, the majority of months saw no actual changes at all.
-    # - Ian, who had been the most active maintainer, is now focusing his efforts on a new
-    #   implementation called Tempest. So 2023 is likely to see even fewer changes.
-    # - It's no longer possible to update the Meteor dependency, because newer versions of Meteor
-    #   no longer support the ancient version of Mongo we're stuck on (2.6), and writing automation
-    #   to update everyone's Mongo instances automatically without breaking anyone is too large
-    #   a project for anyone to volunteer for. Since almost all of Sandstorm's dependencies stem
-    #   from Meteor, trying to update dependencies on a monthly basis has become futile, as the
-    #   pinned Meteor version holds everything else back.
-    # - I just have too much to do, and although releases are not a whole lot of work, it feels
-    #   like one more thing on the pile.
-    #
-    # I'm still happy to push releases when there are interesting changes.
+    # thing that drove Kenton to do a release every month, although he occasionally forgot which would
+    # temporarily block new installs. We may reinstate this in the future if warranted.
 #    if [ ! -e "$BUILD_DIR/buildstamp" ] || \
 #       [ $(stat -c %Y "$BUILD_DIR/buildstamp") -lt $(( $(date +%s) - 30*24*60*60 )) ]; then
 #      rm -rf "$BUILD_DIR"
 #      fail "E_PKG_STALE" "The downloaded package seems to be more than a month old. Please verify that your" \
 #           "computer's clock is correct and try again. It could also be that an attacker is" \
 #           "trying to trick you into installing an old version. Please contact" \
-#           "security@sandstorm.io if the problem persists."
+#           "security@sandstorm.org if the problem persists."
 #    fi
   }
 
@@ -1448,6 +1524,12 @@ make_runtime_directories() {
 
   # Make var directories.
   mkdir -p var/{log,pid,mongo} var/sandstorm/{apps,grains,downloads}
+
+  # Fresh installs should initialize directly on MongoDB 7. Existing installs are rejected by
+  # choose_install_dir(), so this does not mark an old MongoDB 2.6 database as migrated.
+  if [ ! -e var/mongo/version ]; then
+    echo "7" > var/mongo/version
+  fi
 
   # Create useful symlinks.
   ln -sfT $BUILD_DIR latest
@@ -1692,7 +1774,7 @@ sandcats_provide_help() {
   echo "You can:"
   echo ""
   echo "* Read more about it at:"
-  echo "  https://docs.sandstorm.io/en/latest/administering/sandcats/"
+  echo "  https://docs.sandstorm.org/en/latest/administering/sandcats/"
   echo ""
   echo "* Recover access to a domain you once registered with sandcats"
   echo ""
@@ -2141,6 +2223,7 @@ make_runtime_directories
 generate_admin_token
 set_permissions
 install_sandstorm_symlinks
+maybe_install_apparmor_userns_profile
 ask_about_starting_at_boot
 configure_start_at_boot_if_desired
 wait_for_server_bind_to_its_port
